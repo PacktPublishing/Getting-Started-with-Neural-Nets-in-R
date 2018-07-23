@@ -1,0 +1,434 @@
+---
+title: "Bing Churn Data"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+library(keras)
+library(lime)
+library(tidyquant)
+library(rsample)
+library(recipes)
+library(yardstick)
+install_keras()
+```
+
+# Load the Churn Data 
+
+```{r}
+# Load libraries
+churn_data_raw <- read_csv("/Users/arun.krishnaswamy/Documents/NeuralNets/BingData.csv")
+glimpse(churn_data_raw)
+```
+
+# Remove unnecessary Data 
+
+```{r}
+# Remove unnecessary data
+churn_data_tbl <- churn_data_raw %>%
+    select(-customerID) %>%
+    drop_na() %>%
+    select(Churn, everything())
+    
+glimpse(churn_data_tbl)
+```
+
+```{r}
+# Split test/training sets
+set.seed(100)
+train_test_split <- initial_split(churn_data_tbl, prop = 0.8)
+train_test_split
+```
+
+```{r}
+# Retrieve train and test sets
+train_tbl <- training(train_test_split)
+test_tbl  <- testing(train_test_split) 
+```
+
+#Artificial Neural Networks are best when the data is one-hot encoded, scaled and centered
+
+We do 4 transformations :
+
+1. *log tranform of TotalCharges*   - This will make the distribution of TotalCharges less skewed and more centered  [ Scale ]
+2. *Bin tenure into 6 bins/cohorts/groups* - this should help the ML algorithm detect if a group is more/less susceptible to customer churn.[ Center]
+3. *One-hot encoding* is the process of converting categorical data to sparse data, which has columns of only zeros and ones [one-hot]
+4. *Feature Scaling* 
+
+We will use recipe package for doing the transformations.
+
+```{r}
+# Determine if log transformation improves correlation 
+# between TotalCharges and Churn
+train_tbl %>%
+    select(Churn, TotalCharges) %>%
+    mutate(
+        Churn = Churn %>% as.factor() %>% as.numeric(),
+        LogTotalCharges = log(TotalCharges)
+        ) %>%
+    correlate() %>%
+    focus(Churn) %>%
+    fashion()
+```
+
+#RECIPE
+
+1. *step_discretize()* with the option = list(cuts = 6) to cut the continuous variable for “tenure” (number of years as a customer) to group customers into cohorts.
+2. *step_log()* to log transform “TotalCharges”.
+3. *step_dummy()* to one-hot encode the categorical data. Note that this adds columns of one/zero for categorical data with three or more categories.
+4. *step_center()* to mean-center the data.
+5. *step_scale()* to scale the data.
+
+```{r}
+# Create recipe
+rec_obj <- recipe(Churn ~ ., data = train_tbl) %>%
+    step_discretize(tenure, options = list(cuts = 6)) %>%
+    step_log(TotalCharges) %>%
+    step_dummy(all_nominal(), -all_outcomes()) %>%
+    step_center(all_predictors(), -all_outcomes()) %>%
+    step_scale(all_predictors(), -all_outcomes()) %>%
+    prep(data = train_tbl)
+```
+
+```{r}
+# Print the recipe object
+rec_obj
+```
+
+#BAKING WITH YOUR RECIPE
+
+We can apply the “recipe” to any data set with the bake() function, and it processes the data following the recipe steps. 
+We’ll apply to our training and testing data to convert from raw data to a machine learning dataset
+
+```{r}
+# Predictors
+x_train_tbl <- bake(rec_obj, newdata = train_tbl) %>% select(-Churn)
+x_test_tbl <- bake(rec_obj, newdata = test_tbl) %>% select(-Churn)
+
+glimpse(x_train_tbl)
+```
+
+
+#THE TARGET
+
+One last step, we need to store the actual values (truth) as y_train_vec and y_test_vec, which are needed for modeling our ANN. 
+We convert to a series of numeric ones and zeros which can be accepted by the Keras ANN modeling functions
+
+```{r}
+# Response variables for training and testing sets
+y_train_vec <- ifelse(pull(train_tbl, Churn) == "Yes", 1, 0)
+y_test_vec  <- ifelse(pull(test_tbl, Churn) == "Yes", 1, 0)
+```
+
+#We’ll build a three layer MLP with Keras#. 
+
+*Initialize a sequential model:* The first step is to initialize a sequential model with keras_model_sequential(), which is the beginning of our Keras model. 
+The sequential model is composed of a linear stack of layers.
+
+*Apply layers to the sequential model:* 
+Layers consist of the input layer, hidden layers and an output layer. 
+The input layer is the data and provided it’s formatted correctly there’s nothing more to discuss. 
+The hidden layers and output layers are what controls the ANN inner workings.
+
+*Hidden Layers:* 
+Hidden layers form the neural network nodes that enable non-linear activation using weights. 
+The hidden layers are created using **layer_dense()**. 
+
+We’ll add two hidden layers. We’ll apply units = 16, which is the number of nodes. 
+We’ll select kernel_initializer = "uniform" and activation = "relu" for both layers. 
+The first layer needs to have the input_shape = 35, which is the number of columns in the training set. 
+
+*Dropout Layers:* 
+Dropout layers are used to control overfitting. 
+This eliminates weights below a cutoff threshold to prevent low weights from overfitting the layers. 
+We use the layer_dropout() function add two drop out layers with rate = 0.10 to remove weights below 10%.
+
+*Output Layer:* 
+The output layer specifies the shape of the output and the method of assimilating the learned information. 
+The output layer is applied using the layer_dense(). 
+
+For binary values, the shape should be units = 1. 
+For multi-classification, the units should correspond to the number of classes. 
+We set the kernel_initializer = "uniform" and the activation = "sigmoid" (common for binary classification).
+
+*Compile the model:*
+The last step is to compile the model with **compile()**.
+
+We’ll use optimizer = **"adam"**, which is one of the most popular optimization algorithms. 
+We select loss = **"binary_crossentropy"** since this is a binary classification problem. 
+
+We’ll select **metrics = c("accuracy")** to be evaluated during training and testing. 
+
+
+```{r}
+# Building our Artificial Neural Network
+model_keras <- keras_model_sequential()
+
+model_keras %>% 
+    # First hidden layer
+    layer_dense(
+        units              = 16, 
+        kernel_initializer = "uniform", 
+        activation         = "relu", 
+        input_shape        = ncol(x_train_tbl)) %>% 
+    # Dropout to prevent overfitting
+    layer_dropout(rate = 0.1) %>%
+    # Second hidden layer
+    layer_dense(
+        units              = 16, 
+        kernel_initializer = "uniform", 
+        activation         = "relu") %>% 
+    # Dropout to prevent overfitting
+    layer_dropout(rate = 0.1) %>%
+    # Output layer
+    layer_dense(
+        units              = 1, 
+        kernel_initializer = "uniform", 
+        activation         = "sigmoid") %>% 
+    # Compile ANN
+    compile(
+        optimizer = 'adam',
+        loss      = 'binary_crossentropy',
+        metrics   = c('accuracy')
+    )
+model_keras
+```
+
+## Fitting the Model 
+
+We use the fit() function to run the ANN on our training data. 
+The object is our model, and x and y are our training data in matrix and numeric vector forms, respectively. 
+**batch_size = 50** sets the number samples per gradient update within each epoch. 
+**epochs = 35** to control the number training cycles. 
+**validation_split = 0.30** to include 30% of the data for model validation, which prevents overfitting. 
+
+```{r}
+# Fit the keras model to the training data
+fit_keras <- fit(
+    object           = model_keras, 
+    x                = as.matrix(x_train_tbl), 
+    y                = y_train_vec,
+    batch_size       = 50, 
+    epochs           = 35,
+    validation_split = 0.30
+    )
+```
+```{r}
+# Print the final model
+fit_keras
+```
+
+```{r}
+# Plot the training/validation history of our Keras model
+plot(fit_keras) +
+    theme_tq() +
+    scale_color_tq() +
+    scale_fill_tq() +
+    labs(title = "Neural Net Training Results")
+```
+
+We’ve got a good model based on the validation accuracy. Now let’s make some predictions from our keras model on the test data set, which was unseen during modeling (we use this for the true performance assessment). 
+We have two functions to generate predictions:
+
+**predict_classes:** Generates class values as a matrix of ones and zeros. Since we are dealing with binary classification, we’ll convert the output to a vector.
+**predict_proba:** Generates the class probabilities as a numeric matrix indicating the probability of being a class. Again, we convert to a numeric vector because there is only one column output.
+
+```{r}
+# Predicted Class
+yhat_keras_class_vec <- predict_classes(object = model_keras, x = as.matrix(x_test_tbl)) %>%
+    as.vector()
+
+# Predicted Class Probability
+yhat_keras_prob_vec  <- predict_proba(object = model_keras, x = as.matrix(x_test_tbl)) %>%
+    as.vector()
+```
+
+## Yardstick Package
+
+```{r}
+# Format test data and predictions for yardstick metrics
+estimates_keras_tbl <- tibble(
+    truth      = as.factor(y_test_vec) %>% fct_recode(yes = "1", no = "0"),
+    estimate   = as.factor(yhat_keras_class_vec) %>% fct_recode(yes = "1", no = "0"),
+    class_prob = yhat_keras_prob_vec
+)
+
+estimates_keras_tbl
+```
+
+```{r}
+options(yardstick.event_first = FALSE)
+# Confusion Table
+estimates_keras_tbl %>% conf_mat(truth, estimate)
+# Accuracy
+estimates_keras_tbl %>% metrics(truth, estimate)
+# AUC
+estimates_keras_tbl %>% roc_auc(truth, class_prob)
+# Precision and Recall
+tibble(
+    precision = estimates_keras_tbl %>% precision(truth, estimate),
+    recall    = estimates_keras_tbl %>% recall(truth, estimate)
+)
+```
+
+
+#Visualization of the MODEL WITH LIME
+
+LIME stands for Local Interpretable Model-agnostic Explanations, and is a method for explaining black-box machine learning model classifiers.
+
+```{r}
+class(model_keras)
+```
+
+```{r}
+# Setup lime::model_type() function for keras
+model_type.keras.models.Sequential <- function(x, ...) {
+    return("classification")
+}
+```
+
+```{r}
+# Setup lime::predict_model() function for keras
+predict_model.keras.models.Sequential <- function(x, newdata, type, ...) {
+    pred <- predict_proba(object = x, x = as.matrix(newdata))
+    return(data.frame(Yes = pred, No = 1 - pred))
+}
+```
+
+
+```{r}
+# Test our predict_model() function
+predict_model(x = model_keras, newdata = x_test_tbl, type = 'raw') %>%
+    tibble::as_tibble()
+```
+```{r}
+# Run lime() on training set
+explainer <- lime::lime(
+    x              = x_train_tbl, 
+    model          = model_keras, 
+    bin_continuous = FALSE)
+```
+
+```{r}
+# Run explain() on explainer
+explanation <- lime::explain(
+    x_test_tbl[1:10,], 
+    explainer    = explainer, 
+    n_labels     = 1, 
+    n_features   = 4,
+    kernel_width = 0.5)
+```
+
+
+#FEATURE IMPORTANCE VISUALIZATION
+
+The payoff for the work we put in using LIME is this feature importance plot. This allows us to visualize each of the first ten cases (observations) from the test data. The top four features for each case are shown. Note that they are not the same for each case. The green bars mean that the feature supports the model conclusion, and the red bars contradict. A few important features based on frequency in first ten cases:
+
+#Tenure (7 cases)
+#Senior Citizen (5 cases)
+#Online Security (4 cases)
+
+
+```{r}
+plot_features(explanation) +
+    labs(title = "LIME Feature Importance Visualization",
+         subtitle = "Hold Out (Test) Set, First 10 Cases Shown")
+
+plot_explanations(explanation) +
+    labs(title = "LIME Feature Importance Heatmap",
+         subtitle = "Hold Out (Test) Set, First 10 Cases Shown")
+```
+
+# Feature Investigation - Visualization withj LIME 
+
+We can investigate features that are most frequent in the LIME feature importance visualization :
+
+#Tenure (7/10 LIME Cases, Highly Correlated)
+#Contract (Highly Correlated)
+#Internet Service (Highly Correlated)
+#Payment Method (Highly Correlated)
+#Senior Citizen (5/10 LIME Cases)
+#Online Security (4/10 LIME Cases)
+
+```{r}
+# Tenure
+churn_data_raw %>%
+ggplot(aes(x = Churn, y = tenure)) +
+geom_jitter(alpha = 0.25, color = palette_light()[[6]]) +
+geom_violin(alpha = 0.6, fill = palette_light()[[1]]) +
+theme_tq() +
+labs(
+title = "Tenure",
+subtitle = "Customers with lower tenure are more likely to leave"
+)
+
+# Contract
+churn_data_raw %>%
+mutate(Churn = ifelse(Churn == "Yes", 1, 0)) %>%
+ggplot(aes(x = as.factor(Contract), y = Churn)) +
+geom_jitter(alpha = 0.25, color = palette_light()[[6]]) +
+geom_violin(alpha = 0.6, fill = palette_light()[[1]]) +
+theme_tq() +
+labs(
+title = "Contract Type",
+subtitle = "Two and one year contracts much less likely to leave",
+x = "Contract"
+)
+
+# Internet Service
+churn_data_raw %>%
+mutate(Churn = ifelse(Churn == "Yes", 1, 0)) %>%
+ggplot(aes(x = as.factor(InternetService), y = Churn)) +
+geom_jitter(alpha = 0.25, color = palette_light()[[6]]) +
+geom_violin(alpha = 0.6, fill = palette_light()[[1]]) +
+theme_tq() +
+labs(
+title = "Internet Service",
+subtitle = "Fiber optic more likely to leave",
+x = "Internet Service"
+)
+
+# Payment Method
+churn_data_raw %>%
+mutate(Churn = ifelse(Churn == "Yes", 1, 0)) %>%
+ggplot(aes(x = as.factor(PaymentMethod), y = Churn)) +
+geom_jitter(alpha = 0.25, color = palette_light()[[6]]) +
+geom_violin(alpha = 0.6, fill = palette_light()[[1]]) +
+theme_tq() +
+labs(
+title = "Payment Method",
+subtitle = "Electronic check more likely to leave",
+x = "Payment Method"
+)
+
+# Senior Citizen
+churn_data_raw %>%
+mutate(Churn = ifelse(Churn == "Yes", 1, 0)) %>%
+ggplot(aes(x = as.factor(SeniorCitizen), y = Churn)) +
+geom_jitter(alpha = 0.25, color = palette_light()[[6]]) +
+geom_violin(alpha = 0.6, fill = palette_light()[[1]]) +
+theme_tq() +
+labs(
+title = "Senior Citizen",
+subtitle = "Non-senior citizens less likely to leave",
+x = "Senior Citizen (Yes = 1)"
+)
+
+# Online Security
+churn_data_raw %>%
+mutate(Churn = ifelse(Churn == "Yes", 1, 0)) %>%
+ggplot(aes(x = OnlineSecurity, y = Churn)) +
+geom_jitter(alpha = 0.25, color = palette_light()[[6]]) +
+geom_violin(alpha = 0.6, fill = palette_light()[[1]]) +
+theme_tq() +
+labs(
+title = "Online Security",
+subtitle = "Customers without online security are more likely to leave"
+)
+```
+
+
